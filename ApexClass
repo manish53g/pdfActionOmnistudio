@@ -1,0 +1,182 @@
+/**
+* @author        Avinash Kumar Singh
+* @date          04/07/2023
+* @description   Controller for axisCAMPreviewPage LWC
+* Modification Log:
+--------------------------------------------------------------------------------------------
+Developer            Date            Description
+--------------------------------------------------------------------------------------------
+Avinash Kumar Singh      04/07/2023      Original Version
+Pankaj Singh Manola      06/09/2023      uppdated to get CAM Report from a common AxisGeneratedDocumentPreviewController class.BB-366
+*/
+public without sharing class AxisCAMIPInvoke {
+    public static String CAMREPORT_TEMPLATENAME = 'AxisHLCAMReportTemplate';
+    public static String NACHPAYMENT_TEMPLATENAME = 'AxisNACHPaymentTemplate';     
+    
+    @AuraEnabled(cacheable=false)
+    public static String generateCAMReport(String recordId, String loanApplicantionName,String typePDF){
+        
+        String procedureName = 'DocumentServiceGateway_DocGeneration';
+        
+        Map<String, Object> ipInput = new Map<String, Object> ();
+        Map<String, Object> ipOutput = new Map<String, Object> ();
+        Map<String, Object> ipOptions = new Map<String, Object> ();
+        
+        DateTime dt = DateTime.now();
+        String dateTimeStr = dt.format('yyyy/MM/dd hh:mm:ss');
+        
+        String objectId = recordId;
+        String contextId = recordId;
+        String templateId = getDocumentTemplate(typePDF);
+        String title = (typePDF == 'CAM'?'CAM_Report_':'NACH_Payment_')+loanApplicantionName+'-'+dateTimeStr;
+        String outputFileFormat = 'pdf';
+        String returnAsPdf = '';
+        String keepIntermediate = '';
+        
+        ipInput.put('objectId', objectId);
+        ipInput.put('contextId', contextId);
+        ipInput.put('templateId', templateId);
+        ipInput.put('title', title);
+        ipInput.put('returnAsPdf', returnAsPdf);
+        ipInput.put('keepIntermediate', keepIntermediate);
+        ipInput.put('outputFileFormat', outputFileFormat); 
+        
+        try{
+            ipOutput = (Map<String, Object>) omnistudio.IntegrationProcedureService.runIntegrationService(procedureName, ipInput, ipOptions);
+            System.debug('ipOutput =====>'+ipOutput);
+        }catch(Exception exc){System.debug('Exception: ' + exc);}
+        
+        try{
+            String jobIdIp = (String)ipOutput.get('jobId');
+            if(jobIdIp != null){
+                updateLoanAppRecords(new Set<Id>{recordId});//BB-899, BB-901, BB-902
+                return jobIdIp;
+            }
+            else{
+                LogUtil.log('LOS','JobId not returned from DocumentServiceGateway_DocGeneration IP',null);
+                return null;
+            }
+        }catch(Exception ex){
+            LogUtil.log('LOS',ex,null);
+            return null;
+        }
+        
+    }
+    public static String getDocumentTemplate(String typePDF){
+        List<DocumentTemplate> docTemplate= [
+            SELECT id,type,isactive,name,tokenmappingtype,versionnumber 
+            FROM DocumentTemplate 
+            WHERE (IsActive = true AND Name = : (typePDF == 'CAM'?CAMREPORT_TEMPLATENAME:NACHPAYMENT_TEMPLATENAME) AND TokenMappingType = 'JSON' AND Type = 'MicrosoftWord') 
+            WITH SYSTEM_MODE 
+            LIMIT 1];
+        if(docTemplate.size() > 0){
+            return docTemplate[0].Id;
+        }
+        else{
+            LogUtil.log('LOS','No Active Template Found with the name AxisCAMReportTemplate',null);
+        }
+        return null;
+    }
+    @AuraEnabled(cacheable=false)
+    public static WrapperClass getResponseText(String recordId,String jobId,String oldDocId){
+        if(jobId != null && jobId !=''){
+            DocumentGenerationProcess docGenProcess = [SELECT id,responsetext FROM DocumentGenerationProcess WHERE Id =:jobId WITH SYSTEM_MODE];
+            if(docGenProcess.ResponseText != null){
+                String docgenresponseText =docGenProcess.ResponseText;
+                ContentVersion finalContentVersion;
+                if(oldDocId != null){
+                    ContentVersion ipContentVersion =[SELECT Id,ContentDocumentId,PathOnClient,Title,VersionData,VersionNumber FROM ContentVersion Where Id = :docgenresponseText WITH SYSTEM_MODE];
+                    finalContentVersion = createNewVersion(oldDocId,ipContentVersion);
+                    
+                    Delete [Select Id from ContentDocument Where Id= :ipContentVersion.ContentDocumentId WITH SYSTEM_MODE];
+                }
+                else{
+                    finalContentVersion = [SELECT id,ContentDocumentId,Title FROM ContentVersion WHERE Id =:docgenresponseText WITH SYSTEM_MODE];
+                }
+                
+                /*finalContentVersion.Report_Type__c = LOS_Constants.CAM_REPORT_TYPE; // Updated Contentversion to save CAM type.
+                update as system finalContentVersion;*/
+                // Set Visibility of Document to All Users
+                system.debug('finalContentVersion.ContentDocumentId : '+finalContentVersion.ContentDocumentId);
+                List<ContentDocumentLink> cdllist = new List<ContentDocumentLink>();
+                cdllist = [SELECT Id, LinkedEntityId,ContentDocument.Title  FROM ContentDocumentLink WHERE ContentDocumentId =:finalContentVersion.ContentDocumentId AND LinkedEntityId =:recordId WITH SYSTEM_MODE];
+                
+                if(!cdllist.isEmpty()){
+                    cdllist[0].Visibility = 'AllUsers'; //  Visibility set;
+                    update as system cdllist[0]; //  Visibility updated
+                }
+                
+                WrapperClass wrapItemFld=new WrapperClass();
+                wrapItemFld.docVersionId=finalContentVersion.Id;
+                wrapItemFld.contentDocumentId=finalContentVersion.ContentDocumentId;
+                wrapItemFld.docTitle=finalContentVersion.Title;
+                Boolean calledFromcommunity = isInCommunity();
+                wrapItemFld.isCommunity = calledFromcommunity;
+                
+                return wrapItemFld;
+            }
+            else{
+                LogUtil.log('LOS','ResponseText in the JobId Mising - jobId',null);
+                return null;
+            }
+        }
+        return null;
+    }
+    public static Boolean isInCommunity() {
+        return System.Site.getSiteId() != null;
+    }
+    @AuraEnabled(cacheable=false)
+    public static ContentVersion createNewVersion(Id oldDocId, ContentVersion contVersion){
+        try {
+            ContentVersion newcontVersion = new ContentVersion();
+            newcontVersion.Title  = contVersion.Title;
+            newcontVersion.PathOnClient  = contVersion.PathOnClient;
+            newcontVersion.VersionData = contVersion.VersionData;
+            newcontVersion.ContentDocumentId= oldDocId;
+            insert as system newcontVersion;
+            return newcontVersion;
+        } catch (Exception e) {
+             
+            throw new AuraHandledException(e.getMessage());
+        }
+    }
+    
+    //BB-899, BB-901, BB-902
+    public static void updateLoanAppRecords(Set<Id> loanAppIs){
+        List<ResidentialLoanApplication> loanApps = new List<ResidentialLoanApplication>();
+        for(Id loanAppId : loanAppIs){
+            loanApps.add(new ResidentialLoanApplication(
+                Id = loanAppId,
+                axisltd_Require_CAM_Regeneration__c = false
+            ));
+        }
+        update as system loanApps;
+    }
+    
+    @AuraEnabled(cacheable=false)
+    public static List<ContentDocument> getResponseNew(String newCont){
+        try {
+            List<ContentDocument> newcontDoc = [SELECT id FROM ContentDocument WHERE Id=:newCont];
+            if(!newcontDoc.isEmpty()){
+                return newcontDoc;
+            }else{
+                return null;
+            }
+        } catch (Exception e) {
+            throw new AuraHandledException(e.getMessage());
+        }
+    }
+    
+    public class WrapperClass
+    {
+        @AuraEnabled
+        public String docVersionId;
+        @AuraEnabled
+        public String contentDocumentId;
+        @AuraEnabled
+        public String docTitle;
+        @AuraEnabled
+        public Boolean isCommunity;
+        
+    }
+}
